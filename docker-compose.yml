@@ -1,0 +1,58 @@
+networks:
+  system-network:
+    driver: bridge
+
+volumes:
+  # Create an isolated internal Linux volume for the slave data
+  db-slave-data:
+
+services:
+  db-master:
+    image: postgres:15-alpine
+    container_name: db-master
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydb
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5430:5432"
+    volumes:
+      - ./storage/db-master-slave/master:/docker-entrypoint-initdb.d
+    networks:
+      - system-network
+
+  db-slave:
+    image: postgres:15-alpine
+    container_name: db-slave
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydb
+    ports:
+      - "5431:5432"
+    depends_on:
+      - db-master
+    volumes:
+      # FIX: Use the native named volume for data persistence instead of local folder path
+      - db-slave-data:/var/lib/postgresql/data
+      - ./storage/db-master-slave/slave:/opt/slave-scripts
+    entrypoint: ["/bin/sh", "/opt/slave-scripts/entrypoint.sh"]
+    networks:
+      - system-network
+
+  app-server:
+    build:
+      context: ./services/app-server
+      dockerfile: Dockerfile
+    container_name: fastapi-app
+    ports:
+      - "8000:8000"
+    environment:
+      - MASTER_DB_URL=postgresql://myuser:mypassword@db-master:5432/mydb
+      - SLAVE_DB_URL=postgresql://myuser:mypassword@db-slave:5432/mydb
+    depends_on:
+      - db-master
+      - db-slave
+    networks:
+      - system-network
