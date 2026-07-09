@@ -4,17 +4,20 @@ networks:
 
 volumes:
   # Create an isolated internal Linux volume for the slave data
-  db-slave-data:
+  db-shard0-slave-data:
+  db-shard1-slave-data:
 
 services:
-  db-master:
+
+  db-shard0-master:
     image: postgres:15-alpine
-    container_name: db-master
+    container_name: db-shard0-master
     environment:
       POSTGRES_USER: myuser
       POSTGRES_PASSWORD: mypassword
-      POSTGRES_DB: mydb
+      POSTGRES_DB: shard0_db
       PGDATA: /var/lib/postgresql/data/pgdata
+
     ports:
       - "5430:5432"
     volumes:
@@ -22,37 +25,125 @@ services:
     networks:
       - system-network
 
-  db-slave:
+  db-shard0-slave:
     image: postgres:15-alpine
-    container_name: db-slave
+    container_name: db-shard0-slave
     environment:
       POSTGRES_USER: myuser
       POSTGRES_PASSWORD: mypassword
-      POSTGRES_DB: mydb
+      POSTGRES_DB: shard0_db
+      MASTER_HOST: db-shard0-master
     ports:
       - "5431:5432"
     depends_on:
-      - db-master
+      - db-shard0-master
     volumes:
-      # FIX: Use the native named volume for data persistence instead of local folder path
-      - db-slave-data:/var/lib/postgresql/data
+      - db-shard0-slave-data:/var/lib/postgresql/data
+      - ./storage/db-master-slave/slave:/opt/slave-scripts
+    entrypoint: ["/bin/sh", "/opt/slave-scripts/entrypoint.sh"]
+    networks:
+      - system-network
+    
+  db-shard1-master:
+    image: postgres:15-alpine
+    container_name: db-shard1-master
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: shard1_db
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./storage/db-master-slave/master:/docker-entrypoint-initdb.d
+    networks:
+      - system-network
+
+  db-shard1-slave:
+    image: postgres:15-alpine
+    container_name: db-shard1-slave
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: shard1_db
+      MASTER_HOST: db-shard1-master
+    ports:
+      - "5433:5432"
+    depends_on:
+      - db-shard1-master
+    volumes:
+      - db-shard1-slave-data:/var/lib/postgresql/data
       - ./storage/db-master-slave/slave:/opt/slave-scripts
     entrypoint: ["/bin/sh", "/opt/slave-scripts/entrypoint.sh"]
     networks:
       - system-network
 
-  app-server:
+  redis-cache:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    networks:
+      - system-network
+
+  app-server-1:
     build:
       context: ./services/app-server
       dockerfile: Dockerfile
-    container_name: fastapi-app
-    ports:
-      - "8000:8000"
+    container_name: fastapi-app-server-1
+    volumes:
+      - ./services/app-server:/app
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - MASTER_DB_URL=postgresql://myuser:mypassword@db-master:5432/mydb
-      - SLAVE_DB_URL=postgresql://myuser:mypassword@db-slave:5432/mydb
+      - SHARD0_MASTER_URL=postgresql://myuser:mypassword@db-shard0-master:5432/shard0_db
+      - SHARD0_SLAVE_URL=postgresql://myuser:mypassword@db-shard0-slave:5432/shard0_db
+      - SHARD1_MASTER_URL=postgresql://myuser:mypassword@db-shard1-master:5432/shard1_db
+      - SHARD1_SLAVE_URL=postgresql://myuser:mypassword@db-shard1-slave:5432/shard1_db
+      - REDIS_URL=redis://redis-cache:6379/0
+      - APP_SERVER_NAME=App_Server_1
     depends_on:
-      - db-master
-      - db-slave
+      - db-shard0-master
+      - db-shard0-slave
+      - db-shard1-master
+      - db-shard1-slave
+      - redis-cache
+    networks:
+      - system-network
+    
+  app-server-2:
+    build:
+      context: ./services/app-server
+      dockerfile: Dockerfile
+    container_name: fastapi-app-server-2
+    volumes:
+      - ./services/app-server:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - SHARD0_MASTER_URL=postgresql://myuser:mypassword@db-shard0-master:5432/shard0_db
+      - SHARD0_SLAVE_URL=postgresql://myuser:mypassword@db-shard0-slave:5432/shard0_db
+      - SHARD1_MASTER_URL=postgresql://myuser:mypassword@db-shard1-master:5432/shard1_db
+      - SHARD1_SLAVE_URL=postgresql://myuser:mypassword@db-shard1-slave:5432/shard1_db
+      - REDIS_URL=redis://redis-cache:6379/0
+      - APP_SERVER_NAME=App_Server_2
+    depends_on:
+      - db-shard0-master
+      - db-shard0-slave
+      - db-shard1-master
+      - db-shard1-slave
+      - redis-cache
+    networks:
+      - system-network
+
+  load-balancer:
+    image: nginx:alpine
+    container_name: nginx-lb
+    ports:
+       - 8000:80
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app-server-1
+      - app-server-2
     networks:
       - system-network
