@@ -147,3 +147,24 @@ services:
       - app-server-2
     networks:
       - system-network
+
+
+  app-client:
+    build:
+      context: ./services/app-client
+      dockerfile: Dockerfile
+    container_name: react-chaos-game
+
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./services/app-client:/app
+      - /app/node_modules
+    environment:
+      - VITE_BACKEND_URL=http://localhost:8080
+
+    depends_on:
+      - load-balancer
+    networks:
+      - system-network
+    
