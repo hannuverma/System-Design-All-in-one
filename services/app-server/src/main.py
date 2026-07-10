@@ -1,6 +1,7 @@
 import json
 import asyncio
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import os
 from dotenv import load_dotenv
@@ -185,6 +186,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.post("/items")
 async def create_item(name: str):
     redis_client = system_pools.get("redis")
@@ -332,7 +341,7 @@ async def get_system_status():
 @app.get("/chaos/status")
 async def get_chaos_status():
     docker_client = get_docker_client()
-    targets = ["db-shard0-master", "db-shard0-slave", "db-shard1-master", "db-shard1-slave", "redis-cache", "fastapi-app-server-1", "fastapi-app-server-2"]
+    targets = ["db-shard0-master", "db-shard0-slave", "db-shard1-master", "db-shard1-slave", "redis-cache", "fastapi-app-server-1", "fastapi-app-server-2", "nginx-lb"]
     status_report = {}
     for name in targets:
         try:
@@ -342,12 +351,17 @@ async def get_chaos_status():
             status_report[name] = "not_found"
     return {"status": "success", "cluster_state": status_report}
 
+def delayed_kill(container):
+    import time
+    time.sleep(0.5)
+    container.kill()
+
 @app.post("/chaos/kill/{container_name}")
-async def kill_container(container_name: str):
+async def kill_container(container_name: str, background_tasks: BackgroundTasks):
     docker_client = get_docker_client()
     try:
         container = docker_client.containers.get(container_name)
-        container.kill()
+        background_tasks.add_task(delayed_kill, container)
         return {"status": "success", "message": f"Successfully crashed server node: '{container_name}'"}
     except docker.errors.NotFound:
         raise HTTPException(status_code=404, detail=f"Server node target '{container_name}' not found.")

@@ -1,42 +1,82 @@
 import { useState, useEffect } from 'react';
-import { ClusterMap } from './components/ClusterMap';
-import { ControlPanel } from './components/ControlPanel';
-import type { ServerInfo, ActiveTool, NodeStatus } from './types';
-import { Terminal, ShieldCheck, RefreshCw } from 'lucide-react';
+import type { InfraNode, PipelineConnection, ActiveTool, NodeStatus, PacketTrace } from './types';
+import { PipelineCanvas } from './components/PipelineCanvas';
 import axios from 'axios';
+import './index.css';
 
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8080';
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
 
-// Define a safe boilerplate system baseline map to render during initial boot latency
-const INITIAL_SERVERS: ServerInfo[] = [
-  { name: 'db-shard0-master', role: 'master', shard: 0, status: 'running', health: 100, port: 5430 },
-  { name: 'db-shard0-slave', role: 'slave', shard: 0, status: 'running', health: 100, port: 5431 },
-  { name: 'db-shard1-master', role: 'master', shard: 1, status: 'running', health: 100, port: 5432 },
-  { name: 'db-shard1-slave', role: 'slave', shard: 1, status: 'running', health: 100, port: 5433 },
+/* ====================================================================
+   Infrastructure topology definition.
+   Positions (x, y) are in SVG viewBox coords (760×520).
+   The layout flows:  User → LB → App Servers → Redis / Sharded DBs
+   ==================================================================== */
+
+const INITIAL_NODES: InfraNode[] = [
+  { id: 'lb', name: 'nginx-lb', label: 'LOAD BALANCER', type: 'load-balancer', status: 'running', health: 100, port: 8000, x: 100, y: 120 },
+  { id: 'app1', name: 'fastapi-app-server-1', label: 'APP SERVER 1', type: 'app-server', status: 'running', health: 100, port: 8001, x: 280, y: 70 },
+  { id: 'app2', name: 'fastapi-app-server-2', label: 'APP SERVER 2', type: 'app-server', status: 'running', health: 100, port: 8002, x: 280, y: 170 },
+  { id: 'redis', name: 'redis-cache', label: 'REDIS CACHE', type: 'cache', status: 'running', health: 100, port: 6379, x: 460, y: 120 },
+  { id: 's0m', name: 'db-shard0-master', label: 'SHARD 0 MASTER', type: 'database', role: 'master', shard: 0, status: 'running', health: 100, port: 5430, x: 340, y: 310 },
+  { id: 's0s', name: 'db-shard0-slave', label: 'SHARD 0 SLAVE', type: 'database', role: 'slave', shard: 0, status: 'running', health: 100, port: 5431, x: 340, y: 420 },
+  { id: 's1m', name: 'db-shard1-master', label: 'SHARD 1 MASTER', type: 'database', role: 'master', shard: 1, status: 'running', health: 100, port: 5432, x: 600, y: 310 },
+  { id: 's1s', name: 'db-shard1-slave', label: 'SHARD 1 SLAVE', type: 'database', role: 'slave', shard: 1, status: 'running', health: 100, port: 5433, x: 600, y: 420 },
+];
+
+const CONNECTIONS: PipelineConnection[] = [
+  { from: 'lb', to: 'app1', type: 'request' },
+  { from: 'lb', to: 'app2', type: 'request' },
+  { from: 'app1', to: 'redis', type: 'cache' },
+  { from: 'app2', to: 'redis', type: 'cache' },
+  { from: 'app1', to: 's0m', type: 'request' },
+  { from: 'app2', to: 's0m', type: 'request' },
+  { from: 'app1', to: 's1m', type: 'request' },
+  { from: 'app2', to: 's1m', type: 'request' },
+  { from: 's0m', to: 's0s', label: 'WAL', type: 'replication' },
+  { from: 's1m', to: 's1s', label: 'WAL', type: 'replication' },
 ];
 
 export default function App() {
-  const [servers, setServers] = useState<ServerInfo[]>(INITIAL_SERVERS);
+  const [nodes, setNodes] = useState<InfraNode[]>(INITIAL_NODES);
   const [activeTool, setActiveTool] = useState<ActiveTool>('select');
-  const [logs, setLogs] = useState<string[]>(['[SYSTEM INITIALIZED] Standing by for telemetry input streams...']);
+  const [logs, setLogs] = useState<string[]>(['[SYSTEM] CHAOS ENGINE INITIALIZED. STANDING BY...']);
+  const [taskName, setTaskName] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [traces, setTraces] = useState<PacketTrace[]>([]);
+  const [maxId, setMaxId] = useState<number>(0);
 
-  const addLog = (message: string) => {
-    const timestamp = new Date().toLocaleTimeString();
-    setLogs((prev) => [`[${timestamp}] ${message}`, ...prev.slice(0, 14)]);
+  const addLog = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
+    const ts = new Date().toLocaleTimeString();
+    setLogs(prev => [`[${ts}] ${message.toUpperCase()}`, ...prev.slice(0, 30)]);
   };
 
-  // Telemetry Loop: Polls Nginx Gateway to refresh live Docker container state signatures
+  // Fallback fetcher allows API requests to bypass a dead LB
+  const fetchWithFallback = async (method: 'get' | 'post', path: string) => {
+    const urls = [BACKEND_URL, 'http://localhost:8001', 'http://localhost:8002', 'http://localhost:8003'];
+    for (const url of urls) {
+      try {
+        const res = await axios({ method, url: `${url}${path}` });
+        return res;
+      } catch (err: any) {
+        if (err.response && err.response.status !== 502) {
+            throw err; // Backend returned a real error, don't retry
+        }
+      }
+    }
+    throw new Error('Network Error: All backend nodes unreachable.');
+  };
+
   const fetchClusterStatus = async () => {
     try {
-      const res = await axios.get(`${BACKEND_URL}/chaos/status`);
-      if (res.data && res.data.status === 'success') {
+      // Route management requests directly to the secret server for instant response
+      const res = await axios.get('http://localhost:8003/chaos/status');
+      if (res.data?.status === 'success') {
         const liveStates = res.data.cluster_state;
-        
-        setServers((prevServers) =>
-          prevServers.map((server) => {
-            const dockerStatus: NodeStatus = liveStates[server.name] || 'offline';
+        setNodes(prev =>
+          prev.map(node => {
+            const dockerStatus: NodeStatus = liveStates[node.name] || 'offline';
             return {
-              ...server,
+              ...node,
               status: dockerStatus,
               health: dockerStatus === 'running' ? 100 : 0,
             };
@@ -44,126 +84,236 @@ export default function App() {
         );
       }
     } catch (err) {
-      console.error('Telemetry stream network interrupt:', err);
+      // Silently fail telemetry
     }
   };
 
   useEffect(() => {
     fetchClusterStatus();
-    const heartbeat = setInterval(fetchClusterStatus, 2500);
+    const heartbeat = setInterval(fetchClusterStatus, 2000);
     return () => clearInterval(heartbeat);
   }, []);
 
-  // Action: Equip Hammer and crash a node via FastAPI Docker proxy socket paths
   const handleKillNode = async (containerName: string) => {
-    addLog(`[HAMMER SMACK] Detonating cluster payload target: ${containerName}`);
+    addLog(`💥 DESTROYING ${containerName}...`);
     try {
-      const res = await axios.post(`${BACKEND_URL}/chaos/kill/${containerName}`);
-      addLog(`[BACKEND RESPONSE] ${res.data.message}`);
+      const res = await axios.post(`http://localhost:8003/chaos/kill/${containerName}`);
+      addLog(`✓ ${res.data.message}`, 'success');
       await fetchClusterStatus();
     } catch (err: any) {
-      addLog(`[CRITICAL ERROR] Failed to deliver structural impact to ${containerName}: ${err.message}`);
+      addLog(`✗ Failed: ${err.message}`, 'error');
     }
   };
 
-  // Action: Equip Wrench and revive a node after synchronization bar completes loading
   const handleReviveNode = async (containerName: string) => {
-    addLog(`[WRENCH REVIVE] Dispatching startup pulse sequence to: ${containerName}`);
+    addLog(`🔧 REVIVING ${containerName}...`);
     try {
-      const res = await axios.post(`${BACKEND_URL}/chaos/revive/${containerName}`);
-      addLog(`[BACKEND RESPONSE] ${res.data.message}`);
-      await fetchClusterStatus();
+      const res = await axios.post(`http://localhost:8003/chaos/revive/${containerName}`);
+      addLog(`✓ ${res.data.message}`, 'success');
+      // We don't force status refresh here because PipelineCanvas will wait for telemetry
     } catch (err: any) {
-      addLog(`[CRITICAL ERROR] Failed to restore service to container ${containerName}: ${err.message}`);
+      addLog(`✗ Failed: ${err.message}`, 'error');
     }
   };
 
-  // Action: Submit a Task payload data form string directly to our smart router pools
-  const handleAddTask = async (taskId: number, title: string) => {
-    addLog(`[QUERY SUBMIT] Writing task entry ${taskId} ("${title}"). Calculating shard hash topology...`);
+  const handleInspectNode = async (containerName: string, status: string) => {
+    addLog(`🔍 INSPECTED ${containerName}: STATUS IS ${status}`, 'info');
+    if (status !== 'ONLINE') return;
+    
     try {
-      const res = await axios.post(`${BACKEND_URL}/tasks?task_id=${taskId}&title=${encodeURIComponent(title)}`);
-      addLog(`[TRANSACTION COMPLETED] Shard Assigned: ${res.data.targeted_node.toUpperCase()} (Node: ${res.data.handled_by})`);
+      if (containerName.includes('redis')) {
+        const res = await fetchWithFallback('get', '/redisItems');
+        const count = res.data.count;
+        addLog(`DATA [REDIS]: ${count} KEYS IN CACHE`, 'info');
+      } else if (containerName.includes('db-shard')) {
+        const res = await fetchWithFallback('get', '/slaveItems');
+        const count = Object.keys(res.data.data).length;
+        addLog(`DATA [${containerName.toUpperCase()}]: ${count} ROWS TOTAL`, 'info');
+      }
     } catch (err: any) {
-      const errorMsg = err.response?.data?.detail || err.message;
-      addLog(`[TRANSACTION ROLLBACK] Query rejected: ${errorMsg}`);
+        addLog(`✗ FETCH DATA FAILED: ${err.message}`, 'error');
     }
   };
+
+  const dispatchTrace = (handled_by: string, server: string) => {
+    const serverMap: Record<string, string> = {
+        'App_Server_1': 'app1',
+        'App_Server_2': 'app2',
+        'App_Server_Secret': 'lb',
+        'shard0_master': 's0m',
+        'shard0_slave': 's0s',
+        'shard1_master': 's1m',
+        'shard1_slave': 's1s',
+        'redis_cache_hit': 'redis',
+        'shard0_master_db_cache_miss': 's0m',
+        'shard0_slave_db_cache_miss': 's0s',
+        'shard1_master_db_cache_miss': 's1m',
+        'shard1_slave_db_cache_miss': 's1s'
+    };
+    const route = ['lb', serverMap[handled_by], serverMap[server]].filter(Boolean);
+    if (route.length > 1) {
+      const newTrace: PacketTrace = { id: Date.now() + Math.random(), route };
+      setTraces(prev => [...prev.slice(-20), newTrace]);
+    }
+  };
+
+  const executeRequest = async (itemName: string) => {
+    addLog(`📝 INSERT ITEM "${itemName}" → CALCULATING SHARD...`);
+    try {
+      const res = await fetchWithFallback('post', `/items?name=${encodeURIComponent(itemName)}`);
+      const d = res.data;
+      addLog(`✓ ID=${d.data.id} ROUTED TO ${d.server} (${d.handled_by})`, 'success');
+      dispatchTrace(d.handled_by, d.server);
+      setMaxId(prev => Math.max(prev, d.data.id));
+    } catch (err: any) {
+      const msg = err.response?.data?.detail || err.message;
+      addLog(`✗ WRITE FAILED: ${msg}`, 'error');
+    }
+  };
+
+  const readRequest = async () => {
+    if (maxId === 0) {
+      addLog(`✗ CANNOT READ: DB IS EMPTY`, 'error');
+      return;
+    }
+    const randomId = Math.floor(Math.random() * maxId) + 1;
+    addLog(`📖 READ ITEM ID=${randomId} → FETCHING...`);
+    try {
+      const res = await fetchWithFallback('get', `/items/${randomId}`);
+      const d = res.data;
+      if (d.status === 'error') {
+          addLog(`✗ READ FAILED: ${d.message}`, 'error');
+      } else {
+          addLog(`✓ READ ID=${d.data.id} ROUTED TO ${d.source || d.server} (${d.handled_by})`, 'success');
+          dispatchTrace(d.handled_by, d.source || d.server);
+      }
+    } catch (err: any) {
+      const msg = err.response?.data?.detail || err.message;
+      addLog(`✗ READ FAILED: ${msg}`, 'error');
+    }
+  };
+
+  const handleAddItem = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!taskName.trim()) return;
+    setIsSubmitting(true);
+    await executeRequest(taskName);
+    setTaskName('');
+    setIsSubmitting(false);
+  };
+
+  const handleRandomRequests = async () => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    for (let i = 0; i < 5; i++) {
+        await executeRequest(`retro_item_${Math.floor(Math.random() * 9999)}`);
+        await new Promise(r => setTimeout(r, 400));
+    }
+    setIsSubmitting(false);
+  };
+
+  const aliveCount = nodes.filter(n => n.status === 'running').length;
+  const deadCount = nodes.length - aliveCount;
 
   return (
-    <div className="min-h-screen w-screen p-4 sm:p-8 flex flex-col gap-6 max-w-7xl mx-auto selection:bg-slate-700/50">
-      
-      {/* GLOBAL HUD DISPLAY HEADER */}
-      <header className="w-full flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-slate-900/40 p-6 rounded-3xl border border-slate-800/80 backdrop-blur-md">
-        <div className="flex items-center gap-4">
-          <div className="p-3 bg-indigo-600/10 text-indigo-400 rounded-2xl border border-indigo-500/20 shadow-[0_0_15px_rgba(99,102,241,0.15)]">
-            <ShieldCheck size={28} className="animate-pulse" />
-          </div>
-          <div>
-            <h1 className="text-xl sm:text-2xl font-black tracking-wider text-slate-100 uppercase">
-              Chaos Engine Sandbox
-            </h1>
-            <p className="text-xs text-slate-400 font-mono">
-              Topology: Application-Level Sharding & Replication Controller
-            </p>
-          </div>
-        </div>
-        
-        {/* Active Tool HUD status indicator layout */}
-        <div className="flex items-center gap-3 bg-slate-950 px-4 py-2 rounded-xl border border-slate-800/80">
-          <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Active Weapon:</span>
-          <span className={`text-xs font-black uppercase px-2 py-0.5 rounded ${
-            activeTool === 'select' ? 'text-slate-300 bg-slate-800' :
-            activeTool === 'hammer' ? 'text-amber-400 bg-amber-500/10 border border-amber-500/20' :
-            'text-cyan-400 bg-cyan-500/10 border border-cyan-500/20'
-          }`}>
-            {activeTool}
-          </span>
-          <button 
-            onClick={fetchClusterStatus} 
-            className="p-1 text-slate-500 hover:text-slate-300 transition-colors"
-            title="Force telemetry sync fetch"
-          >
-            <RefreshCw size={14} />
-          </button>
-        </div>
-      </header>
-
-      {/* INTERACTIVE CONTROLLER ARSENAL PANEL */}
-      <ControlPanel
-        activeTool={activeTool}
-        onChangeTool={setActiveTool}
-        onAddTask={handleAddTask}
-      />
-
-      {/* MAP GRID CANVAS GRID COMPONENT */}
-      <ClusterMap
-        servers={servers}
-        activeTool={activeTool}
-        onKillNode={handleKillNode}
-        onReviveNode={handleReviveNode}
-      />
-
-      {/* SCIFI ARCADE REAL-TIME TELEMETRY LOG BLOCK */}
-      <section className="w-full bg-slate-950 rounded-3xl border border-slate-800 p-5 font-mono flex flex-col gap-3 shadow-2xl">
-        <div className="flex items-center gap-2 text-xs font-bold text-slate-400 border-b border-slate-900 pb-2">
-          <Terminal size={14} className="text-indigo-400" />
-          <span>REAL-TIME SANDBOX LOG STREAM</span>
-        </div>
-        <div className="flex flex-col gap-1.5 max-h-[180px] overflow-y-auto text-xs text-slate-400 scrollbar-thin scrollbar-thumb-slate-800">
-          {logs.map((log, index) => (
-            <div 
-              key={index} 
-              className={`leading-relaxed whitespace-pre-wrap transition-opacity duration-300 ${
-                index === 0 ? 'text-indigo-300 font-bold' : 'opacity-50'
-              }`}
-            >
-              {log}
+    <>
+      <div className="grid-bg" />
+      <div className="app-container">
+        <header className="header">
+          <div className="header-title">
+            <div className="header-icon">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="square">
+                <rect x="2" y="2" width="20" height="20" />
+                <path d="M7 7h10v10H7z"/>
+              </svg>
             </div>
-          ))}
-        </div>
-      </section>
+            <div>
+              <h1>CHAOS ENGINE</h1>
+              <span className="subtitle">DISTRIBUTED SYSTEM SANDBOX</span>
+            </div>
+          </div>
+          <div className="header-controls">
+            <div className={`status-pill ${deadCount > 0 ? 'alert' : ''}`}>
+              <span className="status-dot" />
+              <span>{aliveCount}/{nodes.length} ONLINE</span>
+            </div>
+          </div>
+        </header>
 
-    </div>
+        <div className="toolbar">
+          <span className="toolbar-label">ARSENAL</span>
+          <div className="toolbar-section">
+            <button className={`tool-btn ${activeTool === 'select' ? 'active-select' : ''}`}
+              onClick={() => setActiveTool('select')}>
+              [INSPECT]
+            </button>
+            <button className={`tool-btn ${activeTool === 'hammer' ? 'active-hammer' : ''}`}
+              onClick={() => setActiveTool('hammer')}>
+              [HAMMER]
+            </button>
+            <button className={`tool-btn ${activeTool === 'wrench' ? 'active-wrench' : ''}`}
+              onClick={() => setActiveTool('wrench')}>
+              [WRENCH]
+            </button>
+          </div>
+
+          <div className="toolbar-divider" />
+
+          <form className="task-form" onSubmit={handleAddItem}>
+            <span className="toolbar-label">NETWORK</span>
+            <input className="task-input" type="text" placeholder="PAYLOAD..."
+              value={taskName} onChange={e => setTaskName(e.target.value)} required />
+            <button className="submit-btn" type="submit" disabled={isSubmitting}>
+              WRITE 1
+            </button>
+            <button className="submit-btn random-btn" type="button" disabled={isSubmitting} onClick={handleRandomRequests}>
+              WRITE 5
+            </button>
+            <button className="submit-btn" type="button" disabled={isSubmitting || maxId === 0} onClick={readRequest}>
+              READ RANDOM
+            </button>
+          </form>
+        </div>
+
+        <div className="main-content">
+          <PipelineCanvas
+            nodes={nodes}
+            connections={CONNECTIONS}
+            activeTool={activeTool}
+            onKill={handleKillNode}
+            onRevive={handleReviveNode}
+            onInspect={handleInspectNode}
+            traces={traces}
+          />
+
+          <div className="sidebar">
+            <div className="status-cards">
+              <div className="status-cards-title">CLUSTER HEALTH</div>
+              {nodes.map(node => (
+                <div className="status-card" key={node.id}>
+                  <span className="status-card-name">{node.label}</span>
+                  <span className={`status-badge ${node.status === 'running' ? 'online' : 'offline'}`}>
+                    {node.status === 'running' ? 'UP' : 'DOWN'}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <div className="log-terminal">
+              <div className="log-header">
+                <span className="log-header-title">EVENT LOG</span>
+              </div>
+              <div className="log-body">
+                {logs.map((log, i) => (
+                  <div key={i} className={`log-entry ${i === 0 ? 'latest' : ''} ${log.includes('✗') ? 'error' : ''} ${log.includes('✓') ? 'success' : ''}`}>
+                    {log}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
   );
 }

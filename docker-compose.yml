@@ -3,6 +3,8 @@ networks:
     driver: bridge
 
 volumes:
+  db-shard0-master-data:
+  db-shard1-master-data:
   # Create an isolated internal Linux volume for the slave data
   db-shard0-slave-data:
   db-shard1-slave-data:
@@ -21,6 +23,7 @@ services:
     ports:
       - "5430:5432"
     volumes:
+      - db-shard0-master-data:/var/lib/postgresql/data
       - ./storage/db-master-slave/master:/docker-entrypoint-initdb.d
     networks:
       - system-network
@@ -56,6 +59,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
+      - db-shard1-master-data:/var/lib/postgresql/data
       - ./storage/db-master-slave/master:/docker-entrypoint-initdb.d
     networks:
       - system-network
@@ -92,6 +96,8 @@ services:
       context: ./services/app-server
       dockerfile: Dockerfile
     container_name: fastapi-app-server-1
+    ports:
+      - "8001:8000"
     volumes:
       - ./services/app-server:/app
       - /var/run/docker.sock:/var/run/docker.sock
@@ -116,6 +122,8 @@ services:
       context: ./services/app-server
       dockerfile: Dockerfile
     container_name: fastapi-app-server-2
+    ports:
+      - "8002:8000"
     volumes:
       - ./services/app-server:/app
       - /var/run/docker.sock:/var/run/docker.sock
@@ -135,6 +143,32 @@ services:
     networks:
       - system-network
 
+  app-server-secret:
+    build:
+      context: ./services/app-server
+      dockerfile: Dockerfile
+    container_name: fastapi-app-server-secret
+    ports:
+      - "8003:8000"
+    volumes:
+      - ./services/app-server:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - SHARD0_MASTER_URL=postgresql://myuser:mypassword@db-shard0-master:5432/shard0_db
+      - SHARD0_SLAVE_URL=postgresql://myuser:mypassword@db-shard0-slave:5432/shard0_db
+      - SHARD1_MASTER_URL=postgresql://myuser:mypassword@db-shard1-master:5432/shard1_db
+      - SHARD1_SLAVE_URL=postgresql://myuser:mypassword@db-shard1-slave:5432/shard1_db
+      - REDIS_URL=redis://redis-cache:6379/0
+      - APP_SERVER_NAME=App_Server_Secret
+    depends_on:
+      - db-shard0-master
+      - db-shard0-slave
+      - db-shard1-master
+      - db-shard1-slave
+      - redis-cache
+    networks:
+      - system-network
+
   load-balancer:
     image: nginx:alpine
     container_name: nginx-lb
@@ -145,6 +179,7 @@ services:
     depends_on:
       - app-server-1
       - app-server-2
+      - app-server-secret
     networks:
       - system-network
 
@@ -161,7 +196,7 @@ services:
       - ./services/app-client:/app
       - /app/node_modules
     environment:
-      - VITE_BACKEND_URL=http://localhost:8080
+      - VITE_BACKEND_URL=http://localhost:8000
 
     depends_on:
       - load-balancer
